@@ -35,7 +35,7 @@ readonly KCP_PORT=5301
 readonly SOCKS_PORT=1080
 
 # URLs
-readonly DNSTT_BASE_URL="https://dnstt.network"
+readonly DNSTT_BASE_URL="https://raw.githubusercontent.com/Arianlavi/tunnelx/refs/heads/main/dnstt.sh"
 readonly KCPTUN_RELEASES_URL="https://api.github.com/repos/xtaci/kcptun/releases/latest"
 
 # Script path for self-management
