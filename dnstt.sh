@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="2.0"
+readonly SCRIPT_VERSION="1"
 readonly SCRIPT_NAME="dnstt-optimized"
 readonly INSTALL_DIR="/usr/local/bin"
 readonly CONFIG_DIR="/etc/dnstt"
@@ -219,10 +219,83 @@ update_script() {
     exec "$SCRIPT_INSTALL_PATH"
 }
 
+cleanup_iptables() {
+    log_info "Cleaning up old iptables rules..."
+    
+    local interface
+    interface=$(get_default_interface 2>/dev/null || echo "eth0")
+    
+    # Remove all existing DNSTT/KCP related rules (comprehensive cleanup)
+    while iptables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || break
+    done
+    
+    while iptables -C INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null || break
+    done
+    
+    while iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null; do
+        iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || break
+    done
+    
+    # IPv6 cleanup
+    if command -v ip6tables &>/dev/null; then
+        while ip6tables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || break
+        done
+        
+        while ip6tables -C INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null || break
+        done
+        
+        while ip6tables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null; do
+            ip6tables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || break
+        done
+    fi
+    
+    log_info "Old iptables rules cleaned"
+}
+
+cleanup_services() {
+    log_info "Cleaning up old services..."
+    
+    # Stop and disable all related services
+    systemctl stop dnstt-server 2>/dev/null || true
+    systemctl stop kcptun-server 2>/dev/null || true
+    systemctl stop danted 2>/dev/null || true
+    systemctl stop dnstt-fallback 2>/dev/null || true
+    
+    # Disable services that might conflict
+    systemctl disable danted 2>/dev/null || true
+    systemctl disable dnstt-fallback 2>/dev/null || true
+    
+    # Remove fallback service if exists
+    if [[ -f "/etc/systemd/system/dnstt-fallback.service" ]]; then
+        rm -f "/etc/systemd/system/dnstt-fallback.service"
+    fi
+    
+    # Remove Dante override if switching away from SOCKS
+    if [[ -d "/etc/systemd/system/danted.service.d" ]]; then
+        rm -rf "/etc/systemd/system/danted.service.d"
+    fi
+    
+    systemctl daemon-reload
+    
+    log_info "Old services cleaned"
+}
+
 load_config() {
     if [[ ! -f "$CONFIG_DIR/server.conf" ]]; then
         return 1
     fi
+    
+    # Reset variables before loading to ensure clean state
+    USE_KCP=false
+    NS_SUBDOMAIN=""
+    MTU_VALUE=1400
+    TUNNEL_MODE="socks"
+    PRIVATE_KEY_FILE=""
+    PUBLIC_KEY_FILE=""
     
     while IFS='=' read -r key value; do
         [[ -z "$key" || "$key" =~ ^# ]] && continue
@@ -235,11 +308,25 @@ load_config() {
             NS_SUBDOMAIN) NS_SUBDOMAIN="$value" ;;
             MTU_VALUE) MTU_VALUE="$value" ;;
             TUNNEL_MODE) TUNNEL_MODE="$value" ;;
-            USE_KCP) [[ "$value" == "true" ]] && USE_KCP=true || USE_KCP=false ;;
+            USE_KCP) 
+                if [[ "$value" == "true" ]]; then
+                    USE_KCP=true
+                else
+                    USE_KCP=false
+                fi
+                ;;
             PRIVATE_KEY_FILE) PRIVATE_KEY_FILE="$value" ;;
             PUBLIC_KEY_FILE) PUBLIC_KEY_FILE="$value" ;;
         esac
     done < "$CONFIG_DIR/server.conf"
+    
+    # Reconstruct key paths if domain loaded but paths empty
+    if [[ -n "$NS_SUBDOMAIN" && -z "$PRIVATE_KEY_FILE" ]]; then
+        local key_prefix
+        key_prefix=$(echo "$NS_SUBDOMAIN" | tr '.' '_')
+        PRIVATE_KEY_FILE="${CONFIG_DIR}/${key_prefix}_server.key"
+        PUBLIC_KEY_FILE="${CONFIG_DIR}/${key_prefix}_server.pub"
+    fi
     
     log_info "Loaded existing configuration for: $NS_SUBDOMAIN"
     return 0
@@ -269,6 +356,7 @@ get_user_input() {
     local existing_domain="${NS_SUBDOMAIN:-}"
     local existing_mtu="${MTU_VALUE:-1400}"
     local existing_mode="${TUNNEL_MODE:-socks}"
+    local existing_kcp=$USE_KCP
     
     echo ""
     echo "=============================================================="
@@ -315,7 +403,7 @@ get_user_input() {
     echo ""
     
     local kcp_default="n"
-    [[ "$USE_KCP" == true ]] && kcp_default="y"
+    [[ "$existing_kcp" == true ]] && kcp_default="y"
     
     log_question "Enable KCP acceleration? [y/N, current: $kcp_default]: "
     read -r input_kcp
@@ -323,7 +411,7 @@ get_user_input() {
     if [[ "$input_kcp" =~ ^[Yy]$ ]]; then
         USE_KCP=true
         log_info "KCP mode enabled"
-    elif [[ "$input_kcp" =~ ^[Nn]$ ]] || [[ -n "$input_kcp" ]]; then
+    else
         USE_KCP=false
         log_info "KCP mode disabled"
     fi
@@ -335,7 +423,7 @@ get_user_input() {
     echo ""
     
     local mode_default="1"
-    [[ "$TUNNEL_MODE" == "ssh" ]] && mode_default="2"
+    [[ "$existing_mode" == "ssh" ]] && mode_default="2"
     
     log_question "Select mode [1-2, current: $mode_default]: "
     read -r input_mode
@@ -390,7 +478,12 @@ download_dnstt() {
         if command -v wget &>/dev/null; then
             log_info "Trying wget..."
             if wget -q --timeout=30 -O "${temp_dir}/dnstt-server" "${DNSTT_BASE_URL}/${filename}" 2>/dev/null; then
-                log_info "Wget succeeded"
+                if [[ -s "${temp_dir}/dnstt-server" ]] && ! file "${temp_dir}/dnstt-server" | grep -q "HTML"; then
+                    log_info "Wget succeeded"
+                else
+                    rm -rf "$temp_dir"
+                    exit 1
+                fi
             else
                 rm -rf "$temp_dir"
                 exit 1
@@ -457,6 +550,12 @@ create_user() {
 generate_keys() {
     log_info "Generating keys..."
     
+    # Ensure dnstt-server exists before generating keys
+    if [[ ! -f "${INSTALL_DIR}/dnstt-server" ]]; then
+        log_error "dnstt-server binary not found. Cannot generate keys."
+        exit 1
+    fi
+    
     if [[ -f "$PRIVATE_KEY_FILE" && -f "$PUBLIC_KEY_FILE" ]]; then
         log_info "Using existing keys"
     else
@@ -470,7 +569,7 @@ generate_keys() {
     chmod 644 "$PUBLIC_KEY_FILE"
     
     log_info "Public key:"
-    echo "$PUBLIC_KEY_FILE" | xargs cat
+    cat "$PUBLIC_KEY_FILE"
 }
 
 get_default_interface() {
@@ -489,17 +588,10 @@ configure_iptables() {
         log_info "KCP enabled: Redirecting port 53 to KCP port $KCP_PORT"
     fi
     
-    iptables -t nat -C PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "$target_port" 2>/dev/null && \
-        iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports "$target_port" 2>/dev/null || true
+    # Clean old rules first
+    cleanup_iptables
     
-    iptables -C INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null && \
-        iptables -D INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT 2>/dev/null || true
-    
-    if [[ "$USE_KCP" == true ]]; then
-        iptables -C INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null && \
-            iptables -D INPUT -p udp --dport "$KCP_PORT" -j ACCEPT 2>/dev/null || true
-    fi
-    
+    # Add new rules
     iptables -I INPUT -p udp --dport "$DNSTT_PORT" -j ACCEPT
     iptables -t nat -I PREROUTING -i "$interface" -p udp --dport 53 -j REDIRECT --to-ports "$target_port"
     
@@ -556,10 +648,28 @@ detect_ssh_port() {
 
 setup_dante() {
     if [[ "$TUNNEL_MODE" != "socks" ]]; then
+        log_info "SSH mode selected, cleaning up SOCKS services..."
+        
+        # Comprehensive cleanup of Dante
         if systemctl is-active --quiet danted 2>/dev/null; then
             systemctl stop danted
-            systemctl disable danted
         fi
+        systemctl disable danted 2>/dev/null || true
+        
+        # Remove config and overrides
+        [[ -f "/etc/danted.conf" ]] && rm -f "/etc/danted.conf"
+        [[ -d "/etc/systemd/system/danted.service.d" ]] && rm -rf "/etc/systemd/system/danted.service.d"
+        
+        # Also cleanup fallback
+        if systemctl is-active --quiet dnstt-fallback 2>/dev/null; then
+            systemctl stop dnstt-fallback
+        fi
+        systemctl disable dnstt-fallback 2>/dev/null || true
+        [[ -f "/etc/systemd/system/dnstt-fallback.service" ]] && rm -f "/etc/systemd/system/dnstt-fallback.service"
+        
+        systemctl daemon-reload
+        
+        log_info "SOCKS services cleaned up"
         return 0
     fi
     
@@ -630,6 +740,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable dnstt-fallback 2>/dev/null || true
+    systemctl start dnstt-fallback 2>/dev/null || true
 }
 
 create_systemd_services() {
@@ -643,8 +754,8 @@ create_systemd_services() {
         target_port="$SOCKS_PORT"
     fi
     
-    systemctl stop dnstt-server 2>/dev/null || true
-    systemctl stop kcptun-server 2>/dev/null || true
+    # Stop and cleanup old services first
+    cleanup_services
     
     if [[ "$USE_KCP" == true ]]; then
         cat > "${SYSTEMD_DIR}/kcptun-server.service" << EOF
@@ -667,7 +778,12 @@ EOF
         systemctl daemon-reload
         systemctl enable kcptun-server
     else
-        systemctl disable kcptun-server 2>/dev/null || true
+        # Ensure KCP is disabled if not using
+        if [[ -f "${SYSTEMD_DIR}/kcptun-server.service" ]]; then
+            systemctl disable kcptun-server 2>/dev/null || true
+            rm -f "${SYSTEMD_DIR}/kcptun-server.service"
+            systemctl daemon-reload
+        fi
     fi
     
     cat > "${SYSTEMD_DIR}/dnstt-server.service" << EOF
@@ -920,6 +1036,9 @@ handle_menu() {
 run_installation() {
     log_info "Starting installation..."
     
+    # Cleanup first
+    cleanup_services
+    
     detect_os
     detect_arch
     install_dependencies
@@ -932,9 +1051,11 @@ run_installation() {
     get_user_input
     save_config
     
+    # Download binaries first
     download_dnstt
     setup_kcptun_binary
     
+    # Then setup system (after binaries are ready)
     create_user
     generate_keys
     
