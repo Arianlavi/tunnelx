@@ -30,19 +30,19 @@ declare -g ARCH=""
 declare -g PKG_MANAGER=""
 
 log_info() {
-    echo -e "\e[32m[INFO]\e[0m $1"
+    echo -e "\033[32m[INFO]\033[0m $1"
 }
 
 log_warn() {
-    echo -e "\e[33m[WARN]\e[0m $1"
+    echo -e "\033[33m[WARN]\033[0m $1"
 }
 
 log_error() {
-    echo -e "\e[31m[ERROR]\e[0m $1"
+    echo -e "\033[31m[ERROR]\033[0m $1"
 }
 
 log_question() {
-    echo -ne "\e[34m[INPUT]\e[0m $1"
+    echo -ne "\033[34m[INPUT]\033[0m $1"
 }
 
 check_root() {
@@ -54,27 +54,26 @@ check_root() {
 
 draw_header() {
     clear
-    echo -e "\e[36m╔══════════════════════════════════════════════════════════════════════╗\e[0m"
-    echo -e "\e[36m║\e[0m  \e[1m\e[35mDNSTT Optimized Server\e[0m \e[33mv${SCRIPT_VERSION}\e[0m                                    \e[36m║\e[0m"
-    echo -e "\e[36m║\e[0m  \e[32mHigh-Performance DNS Tunnel with KCP Acceleration\e[0m                   \e[36m║\e[0m"
-    echo -e "\e[36m╚══════════════════════════════════════════════════════════════════════╝\e[0m"
+    echo "=============================================================="
+    echo "  DNSTT Optimized Server v${SCRIPT_VERSION}"
+    echo "  High-Performance DNS Tunnel with KCP Acceleration"
+    echo "=============================================================="
     echo ""
 }
 
 draw_box() {
     local title="$1"
     local content="$2"
-    local width=70
     
-    echo -e "\e[36m┌$(printf '─%.0s' $(seq 1 $width))┐\e[0m"
-    printf "\e[36m│\e[0m \e[1m%-${width}s\e[0m\e[36m│\e[0m\n" "$title"
-    echo -e "\e[36m├$(printf '─%.0s' $(seq 1 $width))┤\e[0m"
+    echo "=============================================================="
+    echo " $title"
+    echo "=============================================================="
     
     while IFS= read -r line; do
-        printf "\e[36m│\e[0m %-70s \e[36m│\e[0m\n" "$line"
+        echo " $line"
     done <<< "$content"
     
-    echo -e "\e[36m└$(printf '─%.0s' $(seq 1 $width))┘\e[0m"
+    echo "=============================================================="
 }
 
 detect_os() {
@@ -138,7 +137,7 @@ install_dependencies() {
             apt update -qq
             debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v4 boolean true"
             debconf-set-selections <<< "iptables-persistent iptables-persistent/autosave_v6 boolean true"
-            apt install -y -qq curl wget iptables net-tools iptables-persistent dante-server socat
+            apt install -y -qq curl wget iptables net-tools iptables-persistent dante-server socat kcptun
             ;;
         dnf|yum)
             $PKG_MANAGER install -y -q curl wget iptables iptables-services dante socat
@@ -272,14 +271,14 @@ get_user_input() {
     local existing_mode="${TUNNEL_MODE:-socks}"
     
     echo ""
-    echo -e "\e[36m╔════════════════════════════════════════════════════════════╗\e[0m"
-    echo -e "\e[36m║\e[0m              \e[1mServer Configuration\e[0m                          \e[36m║\e[0m"
-    echo -e "\e[36m╚════════════════════════════════════════════════════════════╝\e[0m"
+    echo "=============================================================="
+    echo "                 Server Configuration"
+    echo "=============================================================="
     echo ""
     
     while true; do
         if [[ -n "$existing_domain" ]]; then
-            log_question "Nameserver subdomain [current: \e[33m$existing_domain\e[0m]: "
+            log_question "Nameserver subdomain [current: $existing_domain]: "
         else
             log_question "Nameserver subdomain [e.g., t.example.com]: "
         fi
@@ -300,7 +299,7 @@ get_user_input() {
         fi
     done
     
-    log_question "MTU value [current: \e[33m$existing_mtu\e[0m, press Enter to keep]: "
+    log_question "MTU value [current: $existing_mtu, press Enter to keep]: "
     read -r input_mtu
     MTU_VALUE="${input_mtu:-$existing_mtu}"
     
@@ -318,7 +317,7 @@ get_user_input() {
     local kcp_default="n"
     [[ "$USE_KCP" == true ]] && kcp_default="y"
     
-    log_question "Enable KCP acceleration? [y/N, current: \e[33m$kcp_default\e[0m]: "
+    log_question "Enable KCP acceleration? [y/N, current: $kcp_default]: "
     read -r input_kcp
     
     if [[ "$input_kcp" =~ ^[Yy]$ ]]; then
@@ -338,7 +337,7 @@ get_user_input() {
     local mode_default="1"
     [[ "$TUNNEL_MODE" == "ssh" ]] && mode_default="2"
     
-    log_question "Select mode [1-2, current: \e[33m$mode_default\e[0m]: "
+    log_question "Select mode [1-2, current: $mode_default]: "
     read -r input_mode
     
     case "${input_mode:-$mode_default}" in
@@ -409,82 +408,38 @@ download_dnstt() {
     log_info "dnstt-server installed"
 }
 
-download_kcptun() {
+setup_kcptun_binary() {
     if [[ "$USE_KCP" != true ]]; then
         return 0
     fi
     
-    log_info "Downloading kcptun-server..."
+    log_info "Setting up kcptun..."
     
-    local temp_dir
-    temp_dir=$(mktemp -d)
-    
-    local kcp_filename="kcptun-linux-${ARCH}-20240107.tar.gz"
-    local kcp_url="https://github.com/xtaci/kcptun/releases/download/v20240107/${kcp_filename}"
-    
-    log_info "Trying direct download from GitHub..."
-    
-    local attempt=1
-    local max_attempts=3
-    
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "Download attempt $attempt/$max_attempts from $kcp_url"
-        
-        if curl -fsSL --connect-timeout 15 --max-time 90 -L "$kcp_url" -o "${temp_dir}/kcptun.tar.gz" 2>/dev/null; then
-            if [[ -s "${temp_dir}/kcptun.tar.gz" ]]; then
-                log_info "Download successful"
-                break
-            fi
-        fi
-        
-        log_warn "Attempt $attempt failed"
-        ((attempt++))
-        sleep 3
-    done
-    
-    if [[ $attempt -gt $max_attempts ]]; then
-        log_warn "Direct download failed, trying alternative method..."
-        
-        local alt_url="https://github.com/xtaci/kcptun/releases/download/v20231012/kcptun-linux-${ARCH}-20231012.tar.gz"
-        
-        if curl -fsSL --connect-timeout 15 --max-time 90 -L "$alt_url" -o "${temp_dir}/kcptun.tar.gz" 2>/dev/null; then
-            if [[ -s "${temp_dir}/kcptun.tar.gz" ]]; then
-                log_info "Alternative download successful"
-            else
-                log_error "Alternative download also failed"
-                rm -rf "$temp_dir"
-                exit 1
-            fi
+    if command -v kcptun-server &>/dev/null; then
+        log_info "kcptun-server found in PATH"
+        ln -sf "$(which kcptun-server)" "${INSTALL_DIR}/kcptun-server" 2>/dev/null || true
+    elif [[ -f "/usr/bin/kcptun-server" ]]; then
+        log_info "kcptun-server found at /usr/bin/kcptun-server"
+        ln -sf "/usr/bin/kcptun-server" "${INSTALL_DIR}/kcptun-server" 2>/dev/null || true
+    elif [[ -f "/usr/local/bin/kcptun-server" ]]; then
+        log_info "kcptun-server found at /usr/local/bin/kcptun-server"
+    else
+        log_warn "kcptun-server not found, attempting to locate..."
+        local kcp_path
+        kcp_path=$(find /usr -name "kcptun-server" -type f 2>/dev/null | head -n1)
+        if [[ -n "$kcp_path" ]]; then
+            log_info "Found kcptun-server at $kcp_path"
+            ln -sf "$kcp_path" "${INSTALL_DIR}/kcptun-server" 2>/dev/null || true
         else
-            log_error "All download attempts failed"
-            rm -rf "$temp_dir"
+            log_error "kcptun-server not found. Please install kcptun package."
             exit 1
         fi
     fi
     
-    if ! tar -tzf "${temp_dir}/kcptun.tar.gz" &>/dev/null; then
-        log_error "Downloaded file is not a valid tar.gz archive"
-        rm -rf "$temp_dir"
-        exit 1
+    if [[ -f "${INSTALL_DIR}/kcptun-server" ]]; then
+        chmod +x "${INSTALL_DIR}/kcptun-server"
+        log_info "kcptun-server ready at ${INSTALL_DIR}/kcptun-server"
     fi
-    
-    tar -xzf "${temp_dir}/kcptun.tar.gz" -C "$temp_dir"
-    
-    local kcp_binary
-    kcp_binary=$(find "$temp_dir" -name "server_linux*" -type f | head -n1)
-    
-    if [[ -z "$kcp_binary" ]]; then
-        log_error "KCP binary not found in archive"
-        ls -la "$temp_dir"
-        rm -rf "$temp_dir"
-        exit 1
-    fi
-    
-    chmod +x "$kcp_binary"
-    mv "$kcp_binary" "${INSTALL_DIR}/kcptun-server"
-    rm -rf "$temp_dir"
-    
-    log_info "kcptun-server installed successfully"
 }
 
 create_user() {
@@ -515,7 +470,7 @@ generate_keys() {
     chmod 644 "$PUBLIC_KEY_FILE"
     
     log_info "Public key:"
-    echo -e "\e[33m$(cat "$PUBLIC_KEY_FILE")\e[0m"
+    echo "$PUBLIC_KEY_FILE" | xargs cat
 }
 
 get_default_interface() {
@@ -790,37 +745,37 @@ start_services() {
 show_status() {
     draw_header
     
-    echo -e "\e[36m╔════════════════════════════════════════════════════════════╗\e[0m"
-    echo -e "\e[36m║\e[0m                    \e[1mService Status\e[0m                          \e[36m║\e[0m"
-    echo -e "\e[36m╚════════════════════════════════════════════════════════════╝\e[0m"
+    echo "=============================================================="
+    echo "                    Service Status"
+    echo "=============================================================="
     echo ""
     
     if systemctl is-active --quiet dnstt-server; then
-        echo -e "  \e[32m●\e[0m DNSTT Server        : \e[32mRunning\e[0m"
+        echo "  [OK] DNSTT Server        : Running"
     else
-        echo -e "  \e[31m●\e[0m DNSTT Server        : \e[31mStopped\e[0m"
+        echo "  [FAIL] DNSTT Server      : Stopped"
     fi
     
     if [[ "$USE_KCP" == true ]]; then
         if systemctl is-active --quiet kcptun-server 2>/dev/null; then
-            echo -e "  \e[32m●\e[0m KCP Accelerator     : \e[32mRunning\e[0m"
+            echo "  [OK] KCP Accelerator     : Running"
         else
-            echo -e "  \e[31m●\e[0m KCP Accelerator     : \e[31mStopped\e[0m"
+            echo "  [FAIL] KCP Accelerator   : Stopped"
         fi
     else
-        echo -e "  \e[33m○\e[0m KCP Accelerator     : \e[33mDisabled\e[0m"
+        echo "  [-] KCP Accelerator      : Disabled"
     fi
     
     if [[ "$TUNNEL_MODE" == "socks" ]]; then
         if systemctl is-active --quiet danted 2>/dev/null; then
-            echo -e "  \e[32m●\e[0m SOCKS Proxy         : \e[32mRunning\e[0m on 127.0.0.1:${SOCKS_PORT}"
+            echo "  [OK] SOCKS Proxy         : Running on 127.0.0.1:${SOCKS_PORT}"
         fi
     fi
     
     echo ""
     
     if systemctl is-active --quiet dnstt-server; then
-        echo -e "\e[36mRecent logs:\e[0m"
+        echo "Recent logs:"
         journalctl -u dnstt-server --no-pager -n 5 -o short 2>/dev/null || true
     fi
 }
@@ -835,22 +790,23 @@ show_config() {
     
     load_config
     
-    local content=""
-    content+="Domain        : ${NS_SUBDOMAIN}\n"
-    content+="MTU           : ${MTU_VALUE}\n"
-    content+="Mode          : ${TUNNEL_MODE}\n"
-    content+="KCP Enabled   : ${USE_KCP}\n"
-    content+="Listen Port   : ${DNSTT_PORT}\n"
-    [[ "$USE_KCP" == true ]] && content+="KCP Port      : ${KCP_PORT}\n"
-    content+="\n"
-    content+="Private Key   : ${PRIVATE_KEY_FILE}\n"
-    content+="Public Key    : ${PUBLIC_KEY_FILE}\n"
-    
-    draw_box "Configuration Details" "$content"
+    echo "=============================================================="
+    echo " Configuration Details"
+    echo "=============================================================="
+    echo " Domain        : ${NS_SUBDOMAIN}"
+    echo " MTU           : ${MTU_VALUE}"
+    echo " Mode          : ${TUNNEL_MODE}"
+    echo " KCP Enabled   : ${USE_KCP}"
+    echo " Listen Port   : ${DNSTT_PORT}"
+    [[ "$USE_KCP" == true ]] && echo " KCP Port      : ${KCP_PORT}"
+    echo ""
+    echo " Private Key   : ${PRIVATE_KEY_FILE}"
+    echo " Public Key    : ${PUBLIC_KEY_FILE}"
+    echo "=============================================================="
     
     if [[ -f "$PUBLIC_KEY_FILE" ]]; then
         echo ""
-        echo -e "\e[33mPublic Key:\e[0m"
+        echo "Public Key:"
         cat "$PUBLIC_KEY_FILE"
     fi
 }
@@ -863,28 +819,30 @@ show_logs() {
 display_final_summary() {
     draw_header
     
-    local box_content=""
-    box_content+="Installation completed successfully!\n"
-    box_content+="\n"
-    box_content+="Domain:        ${NS_SUBDOMAIN}\n"
-    box_content+="MTU:           ${MTU_VALUE}\n"
-    box_content+="Mode:          ${TUNNEL_MODE}\n"
-    box_content+="KCP:           $([[ "$USE_KCP" == true ]] && echo "Enabled (fast3)" || echo "Disabled")\n"
-    box_content+="\n"
-    box_content+="Public Key:\n"
-    box_content+="$(cat "$PUBLIC_KEY_FILE")\n"
-    box_content+="\n"
-    box_content+="Management Commands:\n"
-    box_content+="  dnstt-optimized    - Run this menu\n"
-    box_content+="  systemctl status dnstt-server\n"
-    box_content+="  journalctl -u dnstt-server -f\n"
-    
-    draw_box "Setup Complete" "$box_content"
+    echo "=============================================================="
+    echo " Setup Complete"
+    echo "=============================================================="
+    echo ""
+    echo " Installation completed successfully!"
+    echo ""
+    echo " Domain:        ${NS_SUBDOMAIN}"
+    echo " MTU:           ${MTU_VALUE}"
+    echo " Mode:          ${TUNNEL_MODE}"
+    echo " KCP:           $([[ "$USE_KCP" == true ]] && echo "Enabled (fast3)" || echo "Disabled")"
+    echo ""
+    echo " Public Key:"
+    cat "$PUBLIC_KEY_FILE"
+    echo ""
+    echo " Management Commands:"
+    echo "   dnstt-optimized    - Run this menu"
+    echo "   systemctl status dnstt-server"
+    echo "   journalctl -u dnstt-server -f"
+    echo "=============================================================="
     
     echo ""
-    echo -e "\e[32mServices enabled for auto-start.\e[0m"
+    echo "Services enabled for auto-start."
     echo ""
-    echo -e "\e[36mClient Connection Info:\e[0m"
+    echo "Client Connection Info:"
     echo "  Server: $NS_SUBDOMAIN"
     echo "  Port: 53 (DNS)"
     echo "  Public Key: $(cat "$PUBLIC_KEY_FILE")"
@@ -897,16 +855,17 @@ show_menu() {
     draw_header
     
     if [[ "$UPDATE_AVAILABLE" == true ]]; then
-        echo -e "\e[33mUpdate available! Use option 2.\e[0m\n"
+        echo "Update available! Use option 2."
+        echo ""
     fi
     
-    echo "  \e[1m1)\e[0m Install / Reconfigure Server"
-    echo "  \e[1m2)\e[0m Update Script"
-    echo "  \e[1m3)\e[0m Check Service Status"
-    echo "  \e[1m4)\e[0m View Logs"
-    echo "  \e[1m5)\e[0m Show Configuration"
-    echo "  \e[1m6)\e[0m Restart Services"
-    echo "  \e[1m0)\e[0m Exit"
+    echo "  1) Install / Reconfigure Server"
+    echo "  2) Update Script"
+    echo "  3) Check Service Status"
+    echo "  4) View Logs"
+    echo "  5) Show Configuration"
+    echo "  6) Restart Services"
+    echo "  0) Exit"
     echo ""
     log_question "Select option [0-6]: "
 }
@@ -974,7 +933,7 @@ run_installation() {
     save_config
     
     download_dnstt
-    download_kcptun
+    setup_kcptun_binary
     
     create_user
     generate_keys
